@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Minimal HLS Stream Player</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&family=JetBrains+Mono&display=swap" rel="stylesheet">
+  
+  <!-- Load Hls.js CDN -->
+  <script src="https://cdn.jsdelivr.net/npm/hls.js@1.4.14/dist/hls.min.js"></script>
+
+  <style>
+    :root {
+      --bg: #0b0a12;
+      --card-bg: rgba(255, 255, 255, 0.03);
+      --card-border: rgba(255, 255, 255, 0.08);
+      --accent: #8a2be2;
+      --accent-glow: rgba(138, 43, 226, 0.4);
+      --text: #f5f5f7;
+      --text-muted: #86868b;
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    body {
+      background-color: var(--bg);
+      color: var(--text);
+      font-family: 'Outfit', sans-serif;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: 20px;
+      overflow-x: hidden;
+    }
+
+    /* Ambient background glows */
+    .glow {
+      position: absolute;
+      width: 400px;
+      height: 400px;
+      background: radial-gradient(circle, rgba(138, 43, 226, 0.12) 0%, transparent 70%);
+      filter: blur(60px);
+      z-index: -1;
+      pointer-events: none;
+    }
+
+    .container {
+      width: 100%;
+      max-width: 800px;
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      backdrop-filter: blur(20px);
+      border-radius: 24px;
+      padding: 2.5rem;
+      box-shadow: 0 12px 40px rgba(0, 0, 0, 0.5);
+    }
+
+    h1 {
+      font-size: 1.8rem;
+      font-weight: 700;
+      margin-bottom: 1.5rem;
+      text-align: center;
+      background: linear-gradient(135deg, #ffffff 40%, var(--text-muted));
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+    }
+
+    .input-group {
+      display: flex;
+      gap: 12px;
+      margin-bottom: 1.5rem;
+    }
+
+    input {
+      flex: 1;
+      background: rgba(0, 0, 0, 0.4);
+      border: 1px solid var(--card-border);
+      border-radius: 12px;
+      padding: 14px 18px;
+      color: var(--text);
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.9rem;
+      outline: none;
+      transition: border-color 0.3s;
+    }
+
+    input:focus {
+      border-color: var(--accent);
+      box-shadow: 0 0 10px rgba(138, 43, 226, 0.2);
+    }
+
+    button {
+      background: linear-gradient(135deg, var(--accent), #4a00e0);
+      color: white;
+      border: none;
+      border-radius: 12px;
+      padding: 0 28px;
+      font-family: inherit;
+      font-weight: 600;
+      font-size: 0.95rem;
+      cursor: pointer;
+      box-shadow: 0 4px 15px var(--accent-glow);
+      transition: transform 0.2s, box-shadow 0.2s;
+    }
+
+    button:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 6px 20px rgba(138, 43, 226, 0.6);
+    }
+
+    button:active {
+      transform: translateY(0);
+    }
+
+    .player-wrapper {
+      position: relative;
+      width: 100%;
+      aspect-ratio: 16/9;
+      background: #000;
+      border-radius: 16px;
+      overflow: hidden;
+      border: 1px solid var(--card-border);
+    }
+
+    video {
+      width: 100%;
+      height: 100%;
+      display: block;
+    }
+
+    .error-msg {
+      margin-top: 1rem;
+      color: #ff3d00;
+      font-size: 0.9rem;
+      text-align: center;
+      display: none;
+    }
+  </style>
+</head>
+<body>
+  <div class="glow" style="top: 10%; left: 10%;"></div>
+  <div class="glow" style="bottom: 10%; right: 10%;"></div>
+
+  <div class="container">
+    <h1>HLS Video Stream Player</h1>
+    
+    <div class="input-group">
+      <input type="text" id="stream-url" placeholder="Paste your .m3u8 stream URL here..." value="">
+      <button onclick="playStream()">Play Stream</button>
+    </div>
+
+    <div class="player-wrapper">
+      <video id="video" controls></video>
+    </div>
+    
+    <div id="error" class="error-msg"></div>
+  </div>
+
+  <script>
+    let hls = null;
+
+    function playStream() {
+      const url = document.getElementById('stream-url').value.trim();
+      const video = document.getElementById('video');
+      const errorDiv = document.getElementById('error');
+      
+      errorDiv.style.display = 'none';
+      errorDiv.textContent = '';
+
+      if (!url) {
+        showError('Please enter a URL first.');
+        return;
+      }
+
+      // Reset existing player instance
+      if (hls) {
+        hls.destroy();
+        hls = null;
+      }
+      video.src = '';
+
+      if (Hls.isSupported()) {
+        hls = new Hls({
+          enableWorker: true,
+          lowLatencyMode: true
+        });
+        hls.loadSource(url);
+        hls.attachMedia(video);
+        
+        hls.on(Hls.Events.MANIFEST_PARSED, () => {
+          video.play().catch(err => {
+            console.log("Auto-play blocked, waiting for user click:", err);
+          });
+        });
+
+        hls.on(Hls.Events.ERROR, function (event, data) {
+          if (data.fatal) {
+            switch (data.type) {
+              case Hls.ErrorTypes.NETWORK_ERROR:
+                showError("Network error: failed to download segment/manifest.");
+                hls.startLoad();
+                break;
+              case Hls.ErrorTypes.MEDIA_ERROR:
+                showError("Media error: trying to recover playback...");
+                hls.recoverMediaError();
+                break;
+              default:
+                showError("Fatal playback error occurred.");
+                hls.destroy();
+                break;
+            }
+          }
+        });
+      } 
+      // Native Apple HLS support (Safari / iOS)
+      else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+        video.src = url;
+        video.addEventListener('loadedmetadata', () => {
+          video.play();
+        });
+      } 
+      else {
+        showError("Your browser does not support HLS streaming playback.");
+      }
+    }
+
+    function showError(msg) {
+      const errorDiv = document.getElementById('error');
+      errorDiv.textContent = msg;
+      errorDiv.style.display = 'block';
+    }
+  </script>
+</body>
+</html>
