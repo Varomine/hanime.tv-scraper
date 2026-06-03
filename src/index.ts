@@ -1,6 +1,71 @@
 import { getSignature } from "./signature";
 import { docsHtml } from "./docs";
 
+// Global cache for search index to avoid hitting cached.freeanimehentai.net on every request
+let cachedIndex: any[] | null = null;
+let cacheTime = 0;
+let activeFetchPromise: Promise<any[]> | null = null;
+
+async function fetchSearchIndex(fetchFn: typeof fetch): Promise<any[]> {
+  const now = Date.now();
+  const browserUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+  
+  // Generate signatures using WASM environment
+  let sigs: { ssignature: string; stime: number };
+  try {
+    sigs = await getSignature(fetchFn);
+  } catch (e: any) {
+    if (cachedIndex) {
+      console.warn("Signature generation failed, falling back to expired search index cache:", e);
+      return cachedIndex;
+    }
+    throw new Error(`Failed to generate signature credentials for search index: ${e.message}`);
+  }
+
+  const searchUrl = "https://cached.freeanimehentai.net/api/v10/search_hvs";
+  const searchRes = await fetchFn(searchUrl, {
+    method: "GET",
+    headers: {
+      "Accept": "application/json",
+      "Origin": "https://hanime.tv",
+      "Referer": "https://hanime.tv/",
+      "X-Signature": sigs.ssignature,
+      "X-Time": String(sigs.stime),
+      "X-Signature-Version": "web2",
+      "User-Agent": browserUserAgent,
+    },
+  });
+
+  if (!searchRes.ok) {
+    if (cachedIndex) {
+      console.warn(`Fetch search index failed with status ${searchRes.status}, falling back to expired cache`);
+      return cachedIndex;
+    }
+    throw new Error(`Failed to fetch search index from CDN. Status: ${searchRes.status}`);
+  }
+
+  const searchData: any = await searchRes.json();
+  const allVideos = Object.values(searchData);
+  cachedIndex = allVideos;
+  cacheTime = now;
+  return allVideos;
+}
+
+async function getSearchIndex(fetchFn: typeof fetch): Promise<any[]> {
+  const now = Date.now();
+  // Cache search index for 1 hour
+  if (cachedIndex && (now - cacheTime < 3600000)) {
+    return cachedIndex;
+  }
+  if (activeFetchPromise) {
+    return activeFetchPromise;
+  }
+  activeFetchPromise = fetchSearchIndex(fetchFn).finally(() => {
+    activeFetchPromise = null;
+  });
+  return activeFetchPromise;
+}
+
 // Helper to return CORS headers
 function corsHeaders() {
   return {
@@ -82,40 +147,25 @@ async function handleVideoRequest(slug: string): Promise<Response> {
   const browserUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
   
   try {
-    // 1. Fetch the Hanime.tv webpage HTML
-    const pageUrl = `https://hanime.tv/videos/hentai/${slug}`;
-    const pageRes = await fetch(pageUrl, {
+    // 1. Fetch the Hanime.tv video metadata API directly
+    const apiUrl = `https://hanime.tv/api/v8/video?id=${slug}`;
+    const apiRes = await fetch(apiUrl, {
       headers: {
         "User-Agent": browserUserAgent,
+        "Accept": "application/json",
       },
     });
 
-    if (!pageRes.ok) {
-      return jsonResponse({ error: `Failed to fetch video page from Hanime.tv. Status: ${pageRes.status}` }, 404);
+    if (!apiRes.ok) {
+      return jsonResponse({ error: `Failed to fetch video metadata from Hanime.tv API. Status: ${apiRes.status}` }, apiRes.status);
     }
 
-    const html = await pageRes.text();
-
-    // 2. Parse Nuxt state script
-    const nuxtMatch = html.match(/<script>window\.__NUXT__\s*=\s*(.*?);<\/script>/);
-    if (!nuxtMatch) {
-      return jsonResponse({ error: "Could not find Nuxt state metadata in the webpage" }, 500);
+    const apiData: any = await apiRes.json();
+    const hentaiVideo = apiData.hentai_video;
+    if (!hentaiVideo) {
+      return jsonResponse({ error: "Invalid video metadata API response structure" }, 500);
     }
 
-    // 3. Evaluate Nuxt state safely in V8 context
-    let nuxtData: any;
-    try {
-      nuxtData = parseNuxtState(nuxtMatch[1]);
-    } catch (e: any) {
-      return jsonResponse({ error: `Failed to evaluate Nuxt state metadata: ${e.message}` }, 500);
-    }
-
-    const stateData = nuxtData?.state?.data;
-    if (!stateData || !stateData.video || !stateData.video.hentai_video) {
-      return jsonResponse({ error: "Invalid video metadata state structure" }, 500);
-    }
-
-    const hentaiVideo = stateData.video.hentai_video;
     const videoId = hentaiVideo.id;
 
     // 4. Generate signatures using Emscripten WASM runtime
@@ -145,6 +195,7 @@ async function handleVideoRequest(slug: string): Promise<Response> {
     }
 
     const manifestData: any = await manifestRes.json();
+    console.log("manifestData:", JSON.stringify(manifestData));
 
     // 6. Format streaming qualities and server manifests
     const streamsList: any[] = [];
@@ -161,7 +212,7 @@ async function handleVideoRequest(slug: string): Promise<Response> {
             quality: `${stream.height}p`,
             size_mb: stream.filesize_mbs,
             ext: stream.extension || "m3u8",
-            url: stream.url,
+            url: "https://famous-robinet-kurumi07-041dddc5.koyeb.app/proxy?url="+stream.url,
           });
         }
       }
@@ -172,8 +223,8 @@ async function handleVideoRequest(slug: string): Promise<Response> {
     const cleanDesc = rawDesc.replace(/<\/?[^>]+(>|$)/g, "").trim();
 
     // Map franchise info
-    const franchise = stateData.video.hentai_franchise || {};
-    const franchiseVideos = stateData.video.hentai_franchise_hentai_videos || [];
+    const franchise = apiData.hentai_franchise || {};
+    const franchiseVideos = apiData.hentai_franchise_hentai_videos || [];
 
     // Compile everything to response JSON
     return jsonResponse({
@@ -225,6 +276,9 @@ async function handleLandingRequest(): Promise<Response> {
   try {
     const landingRes = await fetch("https://hanime.tv/api/v8/landing", {
       headers: {
+        "Accept": "application/json",
+        "Origin": "https://hanime.tv",
+        "Referer": "https://hanime.tv/",
         "User-Agent": browserUserAgent,
       },
     });
@@ -265,42 +319,47 @@ async function handleLandingRequest(): Promise<Response> {
 
 // Handler for Search queries
 async function handleSearchRequest(query: string, page: number): Promise<Response> {
-  const browserUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
-  
   try {
-    const searchRes = await fetch("https://search.htv-services.com/", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json;charset=UTF-8",
-        "User-Agent": browserUserAgent,
-      },
-      body: JSON.stringify({
-        search_text: query,
-        page: page,
-        blacklist: [],
-        brands: [],
-        tags: [],
-        tags_mode: "AND",
-        order_by: "title_sortable",
-        ordering: "asc",
-      }),
+    const allVideos = await getSearchIndex(fetch);
+    const queryLower = query.toLowerCase().trim();
+    
+    // Perform search filtering on cached metadata index
+    let filtered = allVideos.filter((v: any) => {
+      return (
+        (v.name && v.name.toLowerCase().includes(queryLower)) ||
+        (v.search_titles && v.search_titles.toLowerCase().includes(queryLower)) ||
+        (v.brand && v.brand.toLowerCase().includes(queryLower)) ||
+        (v.slug && v.slug.toLowerCase().includes(queryLower)) ||
+        (v.tags && v.tags.some((t: string) => t.toLowerCase().includes(queryLower)))
+      );
     });
 
-    if (!searchRes.ok) {
-      return jsonResponse({ error: `Search request failed. Status: ${searchRes.status}` }, 500);
-    }
+    // Sort results by relevance (prefix match first) and then by views descending
+    filtered.sort((a: any, b: any) => {
+      const aName = (a.name || "").toLowerCase();
+      const bName = (b.name || "").toLowerCase();
+      const aStarts = aName.startsWith(queryLower);
+      const bStarts = bName.startsWith(queryLower);
+      if (aStarts && !bStarts) return -1;
+      if (!aStarts && bStarts) return 1;
+      return (b.views || 0) - (a.views || 0);
+    });
 
-    const searchData: any = await searchRes.json();
-    const rawHits = searchData.hits || "[]";
-    const hits = JSON.parse(rawHits);
+    const hitsPerPage = 24;
+    const totalHits = filtered.length;
+    const nbPages = Math.ceil(totalHits / hitsPerPage);
+    
+    // Support 0-indexed page querying
+    const startIndex = page * hitsPerPage;
+    const paginatedResults = filtered.slice(startIndex, startIndex + hitsPerPage);
 
     return jsonResponse({
       success: true,
-      page: searchData.page,
-      nbPages: searchData.nbPages,
-      nbHits: searchData.nbHits,
-      hitsPerPage: searchData.hitsPerPage,
-      results: hits.map((h: any) => ({
+      page: page,
+      nbPages: nbPages,
+      nbHits: totalHits,
+      hitsPerPage: hitsPerPage,
+      results: paginatedResults.map((h: any) => ({
         id: h.id,
         name: h.name,
         slug: h.slug,
@@ -317,206 +376,4 @@ async function handleSearchRequest(query: string, page: number): Promise<Respons
   }
 }
 
-// Custom edge-compliant JS literal parser to avoid eval / new Function
-function parseJsLiteral(text: string, paramMap: Map<string, any>): any {
-  let index = 0;
 
-  function skipWhitespace() {
-    while (index < text.length && /\s/.test(text[index])) {
-      index++;
-    }
-  }
-
-  function parseValue(): any {
-    skipWhitespace();
-    if (index >= text.length) throw new Error("Unexpected end of input");
-
-    const char = text[index];
-
-    // String
-    if (char === '"') {
-      return parseString();
-    }
-
-    // Object
-    if (char === '{') {
-      return parseObject();
-    }
-
-    // Array
-    if (char === '[') {
-      return parseArray();
-    }
-
-    // Number or negative sign
-    if (char === '-' || (char >= '0' && char <= '9') || char === '.') {
-      return parseNumber();
-    }
-
-    // True, False, Null, or Variable
-    return parseIdentifier();
-  }
-
-  function parseString(): string {
-    let result = "";
-    index++; // skip opening double quote
-    while (index < text.length) {
-      const char = text[index];
-      if (char === '"') {
-        index++; // skip closing double quote
-        return result;
-      }
-      if (char === '\\') {
-        index++;
-        const nextChar = text[index];
-        if (nextChar === 'u') {
-          // Unicode escape code like \u002F
-          const hex = text.substring(index + 1, index + 5);
-          result += String.fromCharCode(parseInt(hex, 16));
-          index += 5;
-        } else {
-          // Standard escape sequence
-          const escapeMap: Record<string, string> = {
-            'n': '\n', 'r': '\r', 't': '\t', 'f': '\f', 'b': '\b', '\\': '\\', '"': '"', '/': '/'
-          };
-          result += escapeMap[nextChar] || nextChar;
-          index++;
-        }
-      } else {
-        result += char;
-        index++;
-      }
-    }
-    throw new Error("Unterminated string");
-  }
-
-  function parseObject(): Record<string, any> {
-    const obj: Record<string, any> = {};
-    index++; // skip '{'
-    skipWhitespace();
-
-    if (text[index] === '}') {
-      index++;
-      return obj;
-    }
-
-    while (index < text.length) {
-      skipWhitespace();
-      // Parse key (can be unquoted identifier, or double-quoted string)
-      let key: string;
-      if (text[index] === '"') {
-        key = parseString();
-      } else {
-        // Read unquoted key identifier
-        const start = index;
-        while (index < text.length && /[a-zA-Z0-9_$]/.test(text[index])) {
-          index++;
-        }
-        key = text.substring(start, index);
-      }
-
-      skipWhitespace();
-      if (text[index] !== ':') {
-        throw new Error(`Expected ':' after key at index ${index}, found ${text[index]}`);
-      }
-      index++; // skip ':'
-
-      const val = parseValue();
-      obj[key] = val;
-
-      skipWhitespace();
-      if (text[index] === '}') {
-        index++;
-        return obj;
-      }
-      if (text[index] !== ',') {
-        throw new Error(`Expected ',' or '}' at index ${index}, found ${text[index]}`);
-      }
-      index++; // skip ','
-    }
-    throw new Error("Unterminated object");
-  }
-
-  function parseArray(): any[] {
-    const arr: any[] = [];
-    index++; // skip '['
-    skipWhitespace();
-
-    if (text[index] === ']') {
-      index++;
-      return arr;
-    }
-
-    while (index < text.length) {
-      const val = parseValue();
-      arr.push(val);
-
-      skipWhitespace();
-      if (text[index] === ']') {
-        index++;
-        return arr;
-      }
-      if (text[index] !== ',') {
-        throw new Error(`Expected ',' or ']' at index ${index}`);
-      }
-      index++; // skip ','
-    }
-    throw new Error("Unterminated array");
-  }
-
-  function parseNumber(): number {
-    const start = index;
-    if (text[index] === '-') index++;
-    while (index < text.length && /[0-9.]/.test(text[index])) {
-      index++;
-    }
-    const numStr = text.substring(start, index);
-    return parseFloat(numStr);
-  }
-
-  function parseIdentifier(): any {
-    const start = index;
-    while (index < text.length && /[a-zA-Z0-9_$]/.test(text[index])) {
-      index++;
-    }
-    const ident = text.substring(start, index);
-    
-    if (ident === "true") return true;
-    if (ident === "false") return false;
-    if (ident === "null") return null;
-    if (ident === "undefined") return undefined;
-    
-    // Otherwise, it is a variable parameter name! Look it up in paramMap
-    if (paramMap.has(ident)) {
-      return paramMap.get(ident);
-    }
-    
-    return undefined;
-  }
-
-  return parseValue();
-}
-
-function parseNuxtState(stateStr: string): any {
-  const paramMatch = stateStr.match(/^\(function\(([^)]*)\)/);
-  if (!paramMatch) throw new Error("Could not parse Nuxt function parameters");
-  const params = paramMatch[1].split(',').map(s => s.trim());
-
-  const returnIndex = stateStr.indexOf('return {');
-  if (returnIndex === -1) throw new Error("Could not find return statement in Nuxt state");
-  
-  const lastIndex = stateStr.lastIndexOf('}(');
-  if (lastIndex === -1) throw new Error("Could not find end of return object");
-  
-  const objectBodyText = stateStr.substring(returnIndex + 'return '.length, lastIndex + 1).trim();
-
-  const argsText = stateStr.slice(lastIndex + 2, -2).trim();
-  const args = JSON.parse('[' + argsText + ']');
-
-  const paramMap = new Map<string, any>();
-  for (let i = 0; i < params.length; i++) {
-    paramMap.set(params[i], args[i]);
-  }
-
-  return parseJsLiteral(objectBodyText, paramMap);
-}
