@@ -6,6 +6,88 @@ let cachedIndex: any[] | null = null;
 let cacheTime = 0;
 let activeFetchPromise: Promise<any[]> | null = null;
 
+// --- Cryptography Helpers for secure handshake ---
+const handshakeSecret = "htv-insecure-handshake-v1";
+const aadSecret = "htv-insecure-v1";
+
+function base64urlDecode(str: string): Uint8Array {
+  let n = str.replace(/-/g, "+").replace(/_/g, "/").padEnd(Math.ceil(str.length / 4) * 4, "=");
+  let binary = atob(n);
+  let bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  return bytes;
+}
+
+function base64urlEncode(bytes: Uint8Array): string {
+  let binary = "";
+  for (let i = 0; i < bytes.length; i++) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+}
+
+async function getCryptoKey(usages: KeyUsage[]): Promise<CryptoKey> {
+  const encoder = new TextEncoder();
+  const keyBytes = encoder.encode(handshakeSecret);
+  const hash = await crypto.subtle.digest("SHA-256", keyBytes);
+  return await crypto.subtle.importKey("raw", hash, { name: "AES-GCM" }, false, usages);
+}
+
+async function encryptPayload(payload: any): Promise<string> {
+  const encoder = new TextEncoder();
+  const plaintext = typeof payload === "string" ? payload : JSON.stringify(payload);
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const key = await getCryptoKey(["encrypt"]);
+  
+  const encrypted = await crypto.subtle.encrypt(
+    { name: "AES-GCM", iv: iv, additionalData: encoder.encode(aadSecret), tagLength: 128 },
+    key,
+    encoder.encode(plaintext)
+  );
+  
+  const totalBytes = new Uint8Array(encrypted);
+  const ciphertext = totalBytes.slice(0, -16);
+  const tag = totalBytes.slice(-16);
+  
+  const envelope = {
+    v: 1,
+    alg: "AES-256-GCM",
+    iv: base64urlEncode(iv),
+    tag: base64urlEncode(tag),
+    data: base64urlEncode(ciphertext)
+  };
+  
+  return base64urlEncode(encoder.encode(JSON.stringify(envelope)));
+}
+
+async function decryptToken(token: string): Promise<string> {
+  const decoder = new TextDecoder();
+  const encoder = new TextEncoder();
+  const envelopeBytes = base64urlDecode(token);
+  const envelopeStr = decoder.decode(envelopeBytes);
+  const envelope = JSON.parse(envelopeStr);
+  
+  const key = await getCryptoKey(["decrypt"]);
+  const iv = base64urlDecode(envelope.iv);
+  const tag = base64urlDecode(envelope.tag);
+  const ciphertext = base64urlDecode(envelope.data);
+  
+  // Reconstruct ciphertext + tag
+  const total = new Uint8Array(ciphertext.length + tag.length);
+  total.set(ciphertext, 0);
+  total.set(tag, ciphertext.length);
+  
+  const decrypted = await crypto.subtle.decrypt(
+    { name: "AES-GCM", iv: iv, additionalData: encoder.encode(aadSecret), tagLength: 128 },
+    key,
+    total
+  );
+  
+  return decoder.decode(decrypted);
+}
+
 async function fetchSearchIndex(fetchFn: typeof fetch): Promise<any[]> {
   const now = Date.now();
   const browserUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
@@ -22,19 +104,19 @@ async function fetchSearchIndex(fetchFn: typeof fetch): Promise<any[]> {
     throw new Error(`Failed to generate signature credentials for search index: ${e.message}`);
   }
 
-  const searchUrl = "https://cached.freeanimehentai.net/api/v10/search_hvs";
-  const searchRes = await fetchFn(searchUrl, {
-    method: "GET",
-    headers: {
-      "Accept": "application/json",
-      "Origin": "https://hanime.tv",
-      "Referer": "https://hanime.tv/",
-      "X-Signature": sigs.ssignature,
-      "X-Time": String(sigs.stime),
-      "X-Signature-Version": "web2",
-      "User-Agent": browserUserAgent,
-    },
-  });
+    const searchUrl = "https://guest.freeanimehentai.net/api/v11/search_hvs";
+    const searchRes = await fetchFn(searchUrl, {
+      method: "GET",
+      headers: {
+        "Accept": "application/json",
+        "Origin": "https://hanime.tv",
+        "Referer": "https://hanime.tv/",
+        "X-Signature": sigs.ssignature,
+        "X-Time": String(sigs.stime),
+        "X-Signature-Version": "web2",
+        "User-Agent": browserUserAgent,
+      },
+    });
 
   if (!searchRes.ok) {
     if (cachedIndex) {
@@ -111,6 +193,8 @@ export default {
       });
     }
 
+
+
     // Route: GET /api/video/:slug
     if (url.pathname.startsWith("/api/video/")) {
       const slug = url.pathname.substring("/api/video/".length).trim();
@@ -147,28 +231,14 @@ async function handleVideoRequest(slug: string): Promise<Response> {
   const browserUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
   
   try {
-    // 1. Fetch the Hanime.tv video metadata API directly
-    const apiUrl = `https://hanime.tv/api/v8/video?id=${slug}`;
-    const apiRes = await fetch(apiUrl, {
-      headers: {
-        "User-Agent": browserUserAgent,
-        "Accept": "application/json",
-      },
-    });
-
-    if (!apiRes.ok) {
-      return jsonResponse({ error: `Failed to fetch video metadata from Hanime.tv API. Status: ${apiRes.status}` }, apiRes.status);
+    // 1. Get search index to lookup video metadata
+    const allVideos = await getSearchIndex(fetch);
+    const videoEntry = allVideos.find((v: any) => v.slug === slug);
+    if (!videoEntry) {
+      return jsonResponse({ error: `Video with slug "${slug}" not found` }, 404);
     }
 
-    const apiData: any = await apiRes.json();
-    const hentaiVideo = apiData.hentai_video;
-    if (!hentaiVideo) {
-      return jsonResponse({ error: "Invalid video metadata API response structure" }, 500);
-    }
-
-    const videoId = hentaiVideo.id;
-
-    // 4. Generate signatures using Emscripten WASM runtime
+    // 2. Generate signatures using WASM environment
     let sigs: { ssignature: string; stime: number };
     try {
       sigs = await getSignature(fetch);
@@ -176,9 +246,8 @@ async function handleVideoRequest(slug: string): Promise<Response> {
       return jsonResponse({ error: `Failed to compile/generate signature credentials: ${e.message}` }, 500);
     }
 
-    // 5. Query Hanime manifest using the generated signatures
-    const manifestUrl = `https://h.freeanimehentai.net/api/v8/guest/videos/${videoId}/manifest`;
-    const manifestRes = await fetch(manifestUrl, {
+    // 3. Fetch CSRF token from ct.hanime.tv
+    const csrfRes = await fetch("https://ct.hanime.tv/csrf-token", {
       headers: {
         "Accept": "application/json",
         "Origin": "https://hanime.tv",
@@ -190,67 +259,109 @@ async function handleVideoRequest(slug: string): Promise<Response> {
       },
     });
 
-    if (!manifestRes.ok) {
-      return jsonResponse({ error: `Failed to fetch streaming manifest from CDN. Status: ${manifestRes.status}` }, 500);
+    if (!csrfRes.ok) {
+      return jsonResponse({ error: `Failed to fetch CSRF token. Status: ${csrfRes.status}` }, 500);
     }
 
-    const manifestData: any = await manifestRes.json();
-    console.log("manifestData:", JSON.stringify(manifestData));
+    const csrfData: any = await csrfRes.json();
+    const csrf = csrfData.csrf_token;
 
-    // 6. Format streaming qualities and server manifests
+    // Parse htv_csrf_proof cookie from Set-Cookie header
+    const setCookie = csrfRes.headers.get("set-cookie") || "";
+    const cookieMatch = setCookie.match(/htv_csrf_proof=[^;]+/);
+    const cookie = cookieMatch ? cookieMatch[0] : "";
+
+    // 4. Encrypt the handshake payload
+    const payload = {
+      timestamp_unix: Math.floor(Date.now() / 1000),
+      directive: "htv_player_handshake",
+      slug: slug,
+    };
+    const encryptedToken = await encryptPayload(payload);
+
+    // 5. Send POST request to handshake on auth.hanime.tv
+    const handshakeRes = await fetch("https://auth.hanime.tv/api/v11/handshake", {
+      method: "POST",
+      headers: {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "Origin": "https://hanime.tv",
+        "Referer": "https://hanime.tv/",
+        "X-Signature": sigs.ssignature,
+        "X-Time": String(sigs.stime),
+        "X-Signature-Version": "web2",
+        "X-CSRF-Token": csrf,
+        ...(cookie ? { "Cookie": cookie } : {}),
+        "User-Agent": browserUserAgent,
+      },
+      body: JSON.stringify({ token: encryptedToken }),
+    });
+
+    if (!handshakeRes.ok) {
+      return jsonResponse({ error: `Handshake failed with status: ${handshakeRes.status}` }, 500);
+    }
+
+    const xToken = handshakeRes.headers.get("x-token");
+    if (!xToken) {
+      return jsonResponse({ error: "Handshake response missing x-token header" }, 500);
+    }
+
+    // 6. Decrypt the streaming sources
+    const decrypted = await decryptToken(xToken);
+    const parsedSources = JSON.parse(decrypted);
+
     const streamsList: any[] = [];
-    const servers = manifestData?.videos_manifest?.servers || [];
-    
-    for (const server of servers) {
-      const serverName = server.name || "Unknown";
-      for (const stream of server.streams || []) {
-        if (stream.url) {
-          streamsList.push({
-            server: serverName,
-            width: stream.width,
-            height: stream.height,
-            quality: `${stream.height}p`,
-            size_mb: stream.filesize_mbs,
-            ext: stream.extension || "m3u8",
-            url: "https://famous-robinet-kurumi07-041dddc5.koyeb.app/proxy?url="+stream.url,
-          });
-        }
+    for (const source of parsedSources.sources || []) {
+      if (source.src && source.kind === "normal") {
+        streamsList.push({
+          server: "Highwinds",
+          width: source.width || 0,
+          height: source.height || 0,
+          quality: source.label || `${source.height}p`,
+          size_mb: 0,
+          ext: "m3u8",
+          url: `https://streamrelay.sapis.workers.dev/proxy?url=${encodeURIComponent(
+            source.src.startsWith("http") ? source.src : `https://hanime.tv${source.src}`
+          )}`,
+        });
       }
     }
 
     // Clean up description text (remove HTML elements)
-    const rawDesc = hentaiVideo.description || "";
+    const rawDesc = videoEntry.description || "";
     const cleanDesc = rawDesc.replace(/<\/?[^>]+(>|$)/g, "").trim();
 
-    // Map franchise info
-    const franchise = apiData.hentai_franchise || {};
-    const franchiseVideos = apiData.hentai_franchise_hentai_videos || [];
+    // Map franchise info using same brand videos from our index
+    const brandName = videoEntry.brand;
+    const franchiseVideos = brandName
+      ? allVideos.filter((v: any) => v.brand === brandName && v.id !== videoEntry.id)
+      : [];
 
     // Compile everything to response JSON
     return jsonResponse({
       success: true,
       video: {
-        id: hentaiVideo.id,
-        name: hentaiVideo.name,
-        slug: hentaiVideo.slug,
+        id: videoEntry.id,
+        name: videoEntry.name,
+        slug: videoEntry.slug,
         description: cleanDesc,
-        brand: hentaiVideo.brand,
-        views: hentaiVideo.views,
-        likes: hentaiVideo.likes,
-        dislikes: hentaiVideo.dislikes,
-        downloads: hentaiVideo.downloads,
-        monthly_rank: hentaiVideo.monthly_rank,
-        released_at: hentaiVideo.released_at,
-        created_at: hentaiVideo.created_at,
-        poster_url: hentaiVideo.poster_url,
-        cover_url: hentaiVideo.cover_url,
-        tags: (hentaiVideo.hentai_tags || []).map((t: any) => t.text),
+        brand: videoEntry.brand,
+        views: videoEntry.views || 0,
+        likes: videoEntry.likes || 0,
+        dislikes: videoEntry.dislikes || 0,
+        downloads: videoEntry.downloads || 0,
+        monthly_rank: videoEntry.monthly_rank || 0,
+        released_at: videoEntry.released_at || "",
+        created_at: videoEntry.created_at || "",
+        poster_url: videoEntry.poster_url || "",
+        cover_url: videoEntry.cover_url || "",
+        tags: videoEntry.tags || [],
       },
       franchise: {
-        id: franchise.id || null,
-        title: franchise.title || null,
-        slug: franchise.slug || null,
-        videos: franchiseVideos.map((v: any) => ({
+        id: null,
+        title: brandName || null,
+        slug: brandName ? brandName.toLowerCase().replace(/[^a-z0-9]+/g, "-") : null,
+        videos: franchiseVideos.slice(0, 10).map((v: any) => ({
           id: v.id,
           name: v.name,
           slug: v.slug,
@@ -258,10 +369,6 @@ async function handleVideoRequest(slug: string): Promise<Response> {
         })),
       },
       streams: streamsList,
-      debug: {
-        x_signature: sigs.ssignature,
-        x_time: sigs.stime,
-      }
     });
 
   } catch (err: any) {
@@ -271,31 +378,32 @@ async function handleVideoRequest(slug: string): Promise<Response> {
 
 // Handler for Landing Page lists
 async function handleLandingRequest(): Promise<Response> {
-  const browserUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
-  
   try {
-    const landingRes = await fetch("https://hanime.tv/api/v8/landing", {
-      headers: {
-        "Accept": "application/json",
-        "Origin": "https://hanime.tv",
-        "Referer": "https://hanime.tv/",
-        "User-Agent": browserUserAgent,
-      },
-    });
+    const allVideos = await getSearchIndex(fetch);
 
-    if (!landingRes.ok) {
-      return jsonResponse({ error: `Failed to retrieve landing lists. Status: ${landingRes.status}` }, 500);
-    }
+    // 1. Trending: sort by views descending
+    const trendingList = [...allVideos]
+      .sort((a: any, b: any) => (b.views || 0) - (a.views || 0))
+      .slice(0, 24);
 
-    const landingData: any = await landingRes.json();
-    const sections = landingData.sections || [];
-    const responseSections: any[] = [];
+    // 2. New Releases: sort by released_at descending
+    const newReleasesList = [...allVideos]
+      .sort((a: any, b: any) => {
+        const dateA = a.released_at ? new Date(a.released_at).getTime() : 0;
+        const dateB = b.released_at ? new Date(b.released_at).getTime() : 0;
+        return dateB - dateA;
+      })
+      .slice(0, 24);
 
-    for (const section of sections) {
-      const sectionVideos = section.hentai_videos || [];
-      responseSections.push({
-        title: section.title,
-        videos: sectionVideos.map((v: any) => ({
+    // 3. Most Liked: sort by likes descending
+    const mostLikedList = [...allVideos]
+      .sort((a: any, b: any) => (b.likes || 0) - (a.likes || 0))
+      .slice(0, 24);
+
+    const responseSections = [
+      {
+        title: "Trending",
+        videos: trendingList.map((v: any) => ({
           id: v.id,
           name: v.name,
           slug: v.slug,
@@ -305,8 +413,34 @@ async function handleLandingRequest(): Promise<Response> {
           poster_url: v.poster_url,
           cover_url: v.cover_url,
         })),
-      });
-    }
+      },
+      {
+        title: "New Releases",
+        videos: newReleasesList.map((v: any) => ({
+          id: v.id,
+          name: v.name,
+          slug: v.slug,
+          brand: v.brand,
+          views: v.views,
+          likes: v.likes,
+          poster_url: v.poster_url,
+          cover_url: v.cover_url,
+        })),
+      },
+      {
+        title: "Most Liked",
+        videos: mostLikedList.map((v: any) => ({
+          id: v.id,
+          name: v.name,
+          slug: v.slug,
+          brand: v.brand,
+          views: v.views,
+          likes: v.likes,
+          poster_url: v.poster_url,
+          cover_url: v.cover_url,
+        })),
+      },
+    ];
 
     return jsonResponse({
       success: true,
