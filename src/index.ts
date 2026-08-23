@@ -127,7 +127,9 @@ async function fetchSearchIndex(fetchFn: typeof fetch): Promise<any[]> {
   }
 
   const searchData: any = await searchRes.json();
-  const allVideos = Object.values(searchData);
+  const allVideos = Array.isArray(searchData) 
+    ? searchData 
+    : (Array.isArray(searchData?.data) ? searchData.data : Object.values(searchData));
   cachedIndex = allVideos;
   cacheTime = now;
   return allVideos;
